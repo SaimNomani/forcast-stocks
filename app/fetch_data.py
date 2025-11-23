@@ -29,11 +29,14 @@ def fetch_historical_data(period="5y"):
             
     return pd.DataFrame(all_data)
 
-def fetch_latest_prices():
+def fetch_latest_prices(symbols=None):
     """
     Fetches the single latest daily candle (EOD) for updates.
+    If symbols is None, uses settings.symbols (legacy support).
     """
-    symbols = settings.symbols
+    if symbols is None:
+        symbols = settings.symbols
+        
     data = {}
     print(f"📡 Connecting to YFinance for: {symbols}")
     

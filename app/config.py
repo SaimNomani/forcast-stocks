@@ -2,16 +2,24 @@ from pydantic_settings import BaseSettings
 from typing import List
 
 class Settings(BaseSettings):
-    # Target PSX Stocks
-    symbols: List[str] = ["OGDC.KA", "LUCK.KA", "HUBC.KA"]
+    # Database Configuration
+    database_url: str = "postgresql://user:password@host:port/dbname" # Default, should be overridden by env
+
+    # Stock Lists
+    global_stocks: List[str] = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA"] # Example global stocks
+    local_stocks: List[str] = ["OGDC.KA", "LUCK.KA", "HUBC.KA"] # Example local stocks
     
-    # 24 Hours in seconds (Daily Update)
-    fetch_interval: int = 86400 
+    # Scheduler Settings
+    fetch_interval_seconds: int = 900 # 15 minutes
+    local_update_interval_hours: int = 24
+
+    # Model Settings
     retrain_threshold: float = 0.1
 
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore" # Allow extra fields in .env
 
     @classmethod
     def customise_sources(cls, init_settings, env_settings, file_secret_settings):
@@ -21,7 +29,7 @@ class Settings(BaseSettings):
         class CustomEnvSource(EnvSettingsSource):
             def get_field_value(self, field: Field, field_name: str):
                 value, source = super().get_field_value(field, field_name)
-                if field_name == "symbols" and isinstance(value, str):
+                if field_name in ["global_stocks", "local_stocks"] and isinstance(value, str):
                     value = [s.strip() for s in value.split(",")]
                 return value, source
 
