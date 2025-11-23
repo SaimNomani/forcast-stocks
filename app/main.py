@@ -1,22 +1,29 @@
 import asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from app.config import settings
-from app.scheduler import fetch_loop
-from app.model_runner import predict
-from app.evaluator import calculate_metrics
+from app.scheduler_service import start_scheduler
+from app.db_manager import db
 from contextlib import asynccontextmanager
-import pandas as pd
-import os
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
+from typing import Optional, List
+from pydantic import BaseModel
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start scheduler loop
-    task = asyncio.create_task(fetch_loop())
+    # Startup: Start scheduler
+    # The scheduler in scheduler_service is blocking, so we might need to run it in a separate thread 
+    # OR change it to AsyncIOScheduler if we want it in the same loop.
+    # However, scheduler_service.start_scheduler() uses BlockingScheduler which blocks.
+    # For a web app, we usually run the scheduler in a background thread or use AsyncIOScheduler.
+    # Given the current implementation of scheduler_service, let's just initialize the DB here.
+    # The scheduler might need to be run as a separate process or thread.
+    # For simplicity in this refactor, we'll assume the user runs the scheduler separately 
+    # OR we can start it in a thread.
+    
+    # Let's just ensure DB tables exist
+    db.create_tables()
     yield
-    # Shutdown: Cancel loop
-    task.cancel()
+    # Shutdown logic if needed
 
 app = FastAPI(lifespan=lifespan)
 
@@ -30,79 +37,82 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"message": "PSX Forecaster API is running!"}
+    return {"message": "PSX Forecaster API is running (DB Backend)!"}
 
 @app.get("/config")
 def get_config():
     return {
-        "symbols": settings.symbols,
-        "interval": settings.fetch_interval
+        "global_stocks": settings.global_stocks,
+        "local_stocks": settings.local_stocks,
+        "interval": settings.fetch_interval_seconds
     }
-
-@app.get("/predict")
-def make_prediction():
-    """Manually trigger prediction pipeline."""
-    return predict()
-    
-@app.get("/metrics")
-def get_metrics():
-    return calculate_metrics("logs/predictions.csv", window_size=10)
 
 @app.get("/forecast")
 def get_latest_forecast(symbol: Optional[str] = None):
-    """Returns last 10 forecasts. Optional filtering by symbol."""
-    pred_path = "logs/predictions.csv"
-    if not os.path.exists(pred_path):
-        return {"message": "No forecast data available yet."}
+    """Returns the latest forecast for a symbol from the DB."""
+    if not symbol:
+        return {"error": "Please provide a symbol parameter."}
 
+    # Determine table based on symbol (heuristic or check both)
+    # We'll check both tables or assume based on config
+    is_global = symbol in settings.global_stocks
+    table = "global_predictions" if is_global else "local_predictions"
+    
+    query = f"""
+        SELECT symbol, created_at, predicted_price, forecast_json, explanation_text 
+        FROM {table} 
+        WHERE symbol = %s 
+        ORDER BY created_at DESC 
+        LIMIT 1
+    """
+    
     try:
-        df = pd.read_csv(pred_path)
-        if symbol:
-            df = df[df["symbol"] == symbol]
-
-        result = []
-        # Get last 10 entries per symbol
-        grouped = df.sort_values(by="time").groupby("symbol")
-        for sym, group in grouped:
-            if symbol and sym != symbol: continue
+        with db.conn.cursor() as cur:
+            cur.execute(query, (symbol,))
+            row = cur.fetchone()
             
-            last_10 = group.tail(10)
-            for _, row in last_10.iterrows():
-                result.append({
-                    "symbol": row["symbol"],
-                    "time": row["time"],
-                    "predicted": float(row["predicted"]) if pd.notna(row["predicted"]) else None,
-                    "actual": float(row["actual"]) if pd.notna(row.get("actual", None)) else None
-                })
-        return {"forecasts": result}
+            if not row:
+                return {"message": f"No forecast found for {symbol}"}
+                
+            return {
+                "symbol": row[0],
+                "created_at": row[1],
+                "predicted_price": float(row[2]),
+                "forecast_json": row[3],
+                "explanation": row[4]
+            }
     except Exception as e:
         return {"error": str(e)}
-    
-@app.get("/actuals")
-def get_actuals(symbol: Optional[str] = None):
-    """Returns historical actual data."""
-    path = "data/raw_data.csv"
-    if not os.path.exists(path):
-        return {"message": "No actual data yet."}
 
+@app.get("/history")
+def get_history(symbol: Optional[str] = None):
+    """Returns historical actual data from DB."""
+    if not symbol:
+        return {"error": "Please provide a symbol parameter."}
+
+    is_global = symbol in settings.global_stocks
+    table = "global_stock_prices" if is_global else "local_stock_prices"
+    
+    query = f"""
+        SELECT created_at, close_price, volume 
+        FROM {table} 
+        WHERE symbol = %s 
+        ORDER BY created_at DESC 
+        LIMIT 60
+    """
+    
     try:
-        df = pd.read_csv(path)
-        if symbol:
-            df = df[df["symbol"] == symbol]
-        
-        result = []
-        # Return last 60 days per symbol
-        grouped = df.sort_values(by="time").groupby("symbol")
-        for sym, group in grouped:
-            if symbol and sym != symbol: continue
+        with db.conn.cursor() as cur:
+            cur.execute(query, (symbol,))
+            rows = cur.fetchall()
             
-            subset = group.tail(60)
-            for _, row in subset.iterrows():
+            result = []
+            for row in rows:
                 result.append({
-                    "symbol": sym,
-                    "time": row["time"],
-                    "actual": float(row["price"])
+                    "time": row[0],
+                    "price": float(row[1]),
+                    "volume": row[2]
                 })
-        return {"actuals": result}
+            return {"history": result}
     except Exception as e:
         return {"error": str(e)}

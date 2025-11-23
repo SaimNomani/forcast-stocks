@@ -8,19 +8,19 @@ from app.db_manager import db
 from app.config import settings
 
 def test_db():
-    print("🧪 Testing Database Connection...")
+    print("Testing Database Connection...")
     print(f"URL: {settings.database_url.split('@')[-1]}") # Print host/db only for security
 
     try:
         db.connect()
         if db.conn:
-            print("✅ Connection Successful!")
+            print("Connection Successful!")
             db.create_tables()
-            print("✅ Tables Verified.")
+            print("Tables Verified.")
         else:
-            print("❌ Connection Failed.")
+            print("Connection Failed.")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     test_db()
