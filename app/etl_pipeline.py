@@ -88,7 +88,7 @@ class StockETLPipeline:
 
     # ==================== STEP 1: EXTRACT ====================
     
-    def extract_data(self, symbols):
+    def extract_data(self, symbols, is_global=True):
         """
         STEP 1: EXTRACT
         
@@ -96,18 +96,29 @@ class StockETLPipeline:
         
         Args:
             symbols (list): List of stock symbols (e.g., ['AAPL', 'HUBC.KA'])
+            is_global (bool): True for global stocks (15min, 50 timesteps), False for local (1day, 60 timesteps)
         
         Returns:
             dict: {symbol: DataFrame} containing historical data
         """
-        print(f"\n📥 [EXTRACT] Fetching data for {len(symbols)} symbols...")
+        # Global: 50 timesteps * 15min + buffer = ~7 days of 15min data
+        # Local: 60 timesteps * 1day + 14 for indicators + buffer = ~6 months
+        if is_global:
+            period = "7d"
+            interval = "15m"
+            timesteps = 50
+        else:
+            period = "6mo"
+            interval = "1d"
+            timesteps = 60
+        
+        print(f"\n📥 [EXTRACT] Fetching data for {len(symbols)} symbols (Period: {period}, Interval: {interval}, Timesteps: {timesteps})...")
         data_map = {}
         
         for symbol in symbols:
             try:
-                # Fetch 6 months of history (enough for indicators + 60-day window)
                 ticker = yf.Ticker(symbol)
-                hist = ticker.history(period="6mo", interval="1d")
+                hist = ticker.history(period=period, interval=interval)
                 
                 if not hist.empty:
                     data_map[symbol] = hist
@@ -118,7 +129,6 @@ class StockETLPipeline:
                 print(f"   ❌ Error fetching {symbol}: {e}")
         
         return data_map
-
     # ==================== STEP 2: TRANSFORM ====================
     
     def transform_data(self, raw_data, symbol, is_global):
