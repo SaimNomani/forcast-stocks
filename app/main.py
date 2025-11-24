@@ -1,32 +1,44 @@
-import asyncio
+import sys
+import os
 from fastapi import FastAPI, HTTPException
-from app.config import settings
-from app.scheduler_service import start_scheduler
-from app.db_manager import db
-from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List
-from pydantic import BaseModel
+from contextlib import asynccontextmanager
+from typing import Optional
+from datetime import datetime
+
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(_file_))))
+
+from app.config import settings
+from app.db_manager import db
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start scheduler
-    # The scheduler in scheduler_service is blocking, so we might need to run it in a separate thread 
-    # OR change it to AsyncIOScheduler if we want it in the same loop.
-    # However, scheduler_service.start_scheduler() uses BlockingScheduler which blocks.
-    # For a web app, we usually run the scheduler in a background thread or use AsyncIOScheduler.
-    # Given the current implementation of scheduler_service, let's just initialize the DB here.
-    # The scheduler might need to be run as a separate process or thread.
-    # For simplicity in this refactor, we'll assume the user runs the scheduler separately 
-    # OR we can start it in a thread.
-    
-    # Let's just ensure DB tables exist
+    """
+    Startup and shutdown logic for FastAPI.
+    """
+    # Startup: Initialize database
+    print("🚀 Starting FastAPI application...")
+    db.connect()
     db.create_tables()
+    print("✅ Database initialized")
+    
     yield
-    # Shutdown logic if needed
+    
+    # Shutdown: Close database connection
+    print("🔌 Shutting down FastAPI application...")
+    db.close()
 
-app = FastAPI(lifespan=lifespan)
 
+app = FastAPI(
+    title="PSX Forecaster API",
+    description="Stock price forecasting API with PostgreSQL backend",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,26 +47,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def root():
-    return {"message": "PSX Forecaster API is running (DB Backend)!"}
+    """Health check endpoint."""
+    return {
+        "message": "PSX Forecaster API is running!",
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
+
 
 @app.get("/config")
 def get_config():
+    """Get current configuration."""
     return {
         "global_stocks": settings.global_stocks,
         "local_stocks": settings.local_stocks,
-        "interval": settings.fetch_interval_seconds
+        "fetch_interval_seconds": settings.fetch_interval_seconds,
+        "local_update_interval_hours": settings.local_update_interval_hours
     }
+
 
 @app.get("/forecast")
 def get_latest_forecast(symbol: Optional[str] = None):
-    """Returns the latest forecast for a symbol from the DB."""
+    """
+    Get the latest forecast for a specific symbol.
+    
+    Args:
+        symbol: Stock symbol (e.g., 'AAPL', 'OGDC.KA')
+    
+    Returns:
+        Latest prediction data
+    """
     if not symbol:
-        return {"error": "Please provide a symbol parameter."}
+        raise HTTPException(status_code=400, detail="Please provide a symbol parameter")
 
-    # Determine table based on symbol (heuristic or check both)
-    # We'll check both tables or assume based on config
+    # Check database connection
+    if not db.conn or db.conn.closed:
+        db.connect()
+    
+    if not db.conn:
+        raise HTTPException(status_code=503, detail="Database connection unavailable")
+
+    # Determine table based on symbol
     is_global = symbol in settings.global_stocks
     table = "global_predictions" if is_global else "local_predictions"
     
@@ -72,24 +108,51 @@ def get_latest_forecast(symbol: Optional[str] = None):
             row = cur.fetchone()
             
             if not row:
-                return {"message": f"No forecast found for {symbol}"}
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"No forecast found for {symbol}"
+                )
                 
             return {
                 "symbol": row[0],
-                "created_at": row[1],
-                "predicted_price": float(row[2]),
+                "created_at": row[1].isoformat() if row[1] else None,
+                "predicted_price": float(row[2]) if row[2] else None,
                 "forecast_json": row[3],
                 "explanation": row[4]
             }
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
 
 @app.get("/history")
-def get_history(symbol: Optional[str] = None):
-    """Returns historical actual data from DB."""
+def get_history(symbol: Optional[str] = None, limit: int = 60):
+    """
+    Get historical actual price data for a symbol.
+    
+    Args:
+        symbol: Stock symbol (e.g., 'AAPL', 'OGDC.KA')
+        limit: Number of records to return (default: 60)
+    
+    Returns:
+        Historical price data
+    """
     if not symbol:
-        return {"error": "Please provide a symbol parameter."}
+        raise HTTPException(status_code=400, detail="Please provide a symbol parameter")
 
+    # Validate limit
+    if limit < 1 or limit > 1000:
+        raise HTTPException(status_code=400, detail="Limit must be between 1 and 1000")
+
+    # Check database connection
+    if not db.conn or db.conn.closed:
+        db.connect()
+    
+    if not db.conn:
+        raise HTTPException(status_code=503, detail="Database connection unavailable")
+
+    # Determine table
     is_global = symbol in settings.global_stocks
     table = "global_stock_prices" if is_global else "local_stock_prices"
     
@@ -98,21 +161,61 @@ def get_history(symbol: Optional[str] = None):
         FROM {table} 
         WHERE symbol = %s 
         ORDER BY created_at DESC 
-        LIMIT 60
+        LIMIT %s
     """
     
     try:
         with db.conn.cursor() as cur:
-            cur.execute(query, (symbol,))
+            cur.execute(query, (symbol, limit))
             rows = cur.fetchall()
             
             result = []
             for row in rows:
                 result.append({
-                    "time": row[0],
-                    "price": float(row[1]),
-                    "volume": row[2]
+                    "time": row[0].isoformat() if row[0] else None,
+                    "price": float(row[1]) if row[1] else None,
+                    "volume": int(row[2]) if row[2] else 0
                 })
-            return {"history": result}
+            
+            return {
+                "symbol": symbol,
+                "count": len(result),
+                "history": result
+            }
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/stocks")
+def get_all_stocks():
+    """Get list of all available stocks."""
+    return {
+        "global_stocks": settings.global_stocks,
+        "local_stocks": settings.local_stocks,
+        "total": len(settings.global_stocks) + len(settings.local_stocks)
+    }
+
+
+@app.get("/health")
+def health_check():
+    """Detailed health check endpoint."""
+    # Check database connection
+    db_status = "healthy"
+    try:
+        if not db.conn or db.conn.closed:
+            db.connect()
+        if not db.conn:
+            db_status = "unhealthy"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
+    return {
+        "status": "healthy" if db_status == "healthy" else "degraded",
+        "database": db_status,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+if _name_ == "_main_":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0",port=8000)

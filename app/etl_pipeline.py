@@ -1,19 +1,31 @@
 import os
+import sys
 import joblib
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
-from tensorflow.keras.models import load_model
+
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(_file_))))
+
 from app.db_manager import db
 from app.config import settings
+
+# Conditional imports
+try:
+    from tensorflow.keras.models import load_model
+    TENSORFLOW_AVAILABLE = True
+except ImportError:
+    TENSORFLOW_AVAILABLE = False
+    print("⚠ TensorFlow not available. Prediction functionality will be disabled.")
 
 try:
     import pandas_ta as ta
     PANDAS_TA_AVAILABLE = True
 except ImportError:
     PANDAS_TA_AVAILABLE = False
-    print("⚠️ pandas_ta not found. Using manual calculation for indicators.")
+    print("⚠ pandas_ta not found. Using manual calculation for indicators.")
 
 
 class StockETLPipeline:
@@ -26,7 +38,7 @@ class StockETLPipeline:
     - LOAD: Save actual prices and predictions to PostgreSQL database
     """
     
-    def __init__(self):
+    def _init_(self):
         """
         Initialize the ETL Pipeline.
         - Connect to Database
@@ -47,13 +59,21 @@ class StockETLPipeline:
         self.LOCAL_MODEL_PATH = os.path.join(self.MODELS_DIR, "local_model.h5")
         
         # Load Models (Cache them to avoid reloading)
-        self.global_model = self._load_model(self.GLOBAL_MODEL_PATH, "Global")
-        self.local_model = self._load_model(self.LOCAL_MODEL_PATH, "Local")
+        if TENSORFLOW_AVAILABLE:
+            self.global_model = self._load_model(self.GLOBAL_MODEL_PATH, "Global")
+            self.local_model = self._load_model(self.LOCAL_MODEL_PATH, "Local")
+        else:
+            self.global_model = None
+            self.local_model = None
+            print("⚠ Models not loaded - TensorFlow unavailable")
         
         print("✅ ETL Pipeline initialized successfully.\n")
 
     def _load_model(self, path, name):
         """Helper to load Keras models safely."""
+        if not TENSORFLOW_AVAILABLE:
+            return None
+            
         if os.path.exists(path):
             try:
                 model = load_model(path)
@@ -63,7 +83,7 @@ class StockETLPipeline:
                 print(f"❌ Failed to load {name} model: {e}")
                 return None
         else:
-            print(f"⚠️ {name} model not found at {path}")
+            print(f"⚠ {name} model not found at {path}")
             return None
 
     # ==================== STEP 1: EXTRACT ====================
@@ -93,7 +113,7 @@ class StockETLPipeline:
                     data_map[symbol] = hist
                     print(f"   ✓ Fetched {len(hist)} rows for {symbol}")
                 else:
-                    print(f"   ⚠️ No data found for {symbol}")
+                    print(f"   ⚠ No data found for {symbol}")
             except Exception as e:
                 print(f"   ❌ Error fetching {symbol}: {e}")
         
@@ -146,7 +166,7 @@ class StockETLPipeline:
             df.dropna(inplace=True)
             
             if len(df) < 60:
-                print(f"   ⚠️ Insufficient data after indicators for {symbol} (Rows: {len(df)})")
+                print(f"   ⚠ Insufficient data after indicators for {symbol} (Rows: {len(df)})")
                 return None, None, None
 
         except Exception as e:
@@ -154,15 +174,13 @@ class StockETLPipeline:
             return None, None, None
 
         # --- Action 2: Load Scaler (CRITICAL) ---
-        # Construct scaler path dynamically
-        safe_symbol = symbol.replace(".", "_")  # HUBC.KA -> HUBC_KA
+        safe_symbol = symbol.replace(".", "_")
         scaler_filename = f"{safe_symbol}_scaler.pkl"
         directory = self.GLOBAL_SCALERS_DIR if is_global else self.LOCAL_SCALERS_DIR
         scaler_path = os.path.join(directory, scaler_filename)
         
-        # Error Handling: Skip if scaler doesn't exist
         if not os.path.exists(scaler_path):
-            print(f"   ⚠️ Scaler not found: {scaler_path}. Skipping {symbol}.")
+            print(f"   ⚠ Scaler not found: {scaler_path}. Skipping {symbol}.")
             return None, None, None
         
         try:
@@ -171,31 +189,34 @@ class StockETLPipeline:
             # Prepare features for scaling
             df['Log_Volume'] = np.log1p(df['Volume'])
             
-            # Determine what to scale based on scaler's expected features
+            # Determine features based on scaler
             if hasattr(scaler, 'n_features_in_'):
                 if scaler.n_features_in_ == 4:
                     features_to_scale = df[['Close', 'Log_Volume', 'RSI_14', 'SMA_14']].values
                 elif scaler.n_features_in_ == 1:
                     features_to_scale = df[['Close']].values
                 else:
-                    print(f"   ⚠️ Scaler expects {scaler.n_features_in_} features, unsupported.")
+                    print(f"   ⚠ Scaler expects {scaler.n_features_in_} features, unsupported.")
                     return None, None, None
             else:
-                # Default to Close only
                 features_to_scale = df[['Close']].values
             
             scaled_data = scaler.transform(features_to_scale)
             
             # Get last 60 points for prediction
+            if len(scaled_data) < 60:
+                print(f"   ⚠ Insufficient scaled data for {symbol}")
+                return None, None, None
+                
             last_60_scaled = scaled_data[-60:]
             
-            # Prepare explanation data (latest values)
+            # Prepare explanation data
             latest_row = df.iloc[-1]
             explanation_data = {
-                'Close': latest_row['Close'],
-                'SMA_14': latest_row['SMA_14'],
-                'RSI_14': latest_row['RSI_14'],
-                'Volume': latest_row['Volume']
+                'Close': float(latest_row['Close']),
+                'SMA_14': float(latest_row['SMA_14']),
+                'RSI_14': float(latest_row['RSI_14']),
+                'Volume': int(latest_row['Volume'])
             }
             
             return last_60_scaled, explanation_data, scaler
@@ -217,6 +238,10 @@ class StockETLPipeline:
         Returns:
             dict: {predicted_price, forecast_json} or None on error
         """
+        if not TENSORFLOW_AVAILABLE or model is None:
+            print("   ⚠ Cannot predict - model not available")
+            return None
+            
         try:
             n_features = scaled_data.shape[1]
             input_seq = scaled_data.reshape(1, 60, n_features)
@@ -233,9 +258,8 @@ class StockETLPipeline:
                 pred_reshaped = np.array(pred).reshape(1, 1, -1)
                 
                 if pred_reshaped.shape[2] != n_features:
-                    # Handle dimension mismatch
                     new_step = current_batch[:, -1:, :].copy()
-                    new_step[0, 0, 0] = pred[0]  # Update Close price
+                    new_step[0, 0, 0] = pred[0]
                     current_batch = np.append(current_batch[:, 1:, :], new_step, axis=1)
                 else:
                     current_batch = np.append(current_batch[:, 1:, :], pred_reshaped, axis=1)
@@ -244,7 +268,6 @@ class StockETLPipeline:
             predictions = np.array(predictions)
             
             if scaler.n_features_in_ > 1:
-                # Create dummy array for inverse transform
                 dummy = np.zeros((10, scaler.n_features_in_))
                 dummy[:, 0] = predictions[:, 0]
                 inversed = scaler.inverse_transform(dummy)[:, 0]
@@ -358,7 +381,6 @@ class StockETLPipeline:
         local_data_map = self.extract_data(settings.local_stocks)
         
         for symbol, df in local_data_map.items():
-            # Check last update time
             last_update = db.get_last_update_time(symbol, is_global=False)
             
             should_update = False
@@ -367,11 +389,11 @@ class StockETLPipeline:
                 print(f"   🆕 First time update for {symbol}")
             else:
                 time_diff = datetime.now() - last_update
-                if time_diff > timedelta(hours=24):
+                if time_diff > timedelta(hours=settings.local_update_interval_hours):
                     should_update = True
                     print(f"   🕒 >24h since last update for {symbol} (Last: {last_update})")
                 else:
-                    print(f"   ⏭️ Skipping {symbol} (Updated {time_diff} ago)")
+                    print(f"   ⏭ Skipping {symbol} (Updated {time_diff} ago)")
             
             if should_update:
                 self._process_symbol(symbol, df, is_global=False)
@@ -392,7 +414,7 @@ class StockETLPipeline:
         scaled_data, explanation_data, scaler = self.transform_data(raw_data, symbol, is_global)
         
         if scaled_data is None:
-            return  # Skip if transformation failed
+            return
         
         # Predict
         model = self.global_model if is_global else self.local_model
@@ -403,8 +425,5 @@ class StockETLPipeline:
         prediction_result = self._predict(model, scaled_data, scaler)
         
         if prediction_result:
-            # Add explanation
             prediction_result['explanation_text'] = self._generate_explanation(explanation_data)
-            
-            # Step 3: Load
-            self.load_predictions(symbol, explanation_data, prediction_result, is_global)
+            self.load_predictions(symbol, explanation_data, prediction_result,is_global)
