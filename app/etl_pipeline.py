@@ -144,7 +144,7 @@ class StockETLPipeline:
         Args:
             raw_data (DataFrame): Raw stock data from YFinance
             symbol (str): Stock symbol
-            is_global (bool): True for global stocks, False for local
+            is_global (bool): True for global stocks (50 timesteps), False for local (60 timesteps)
         
         Returns:
             tuple: (scaled_data, explanation_data, scaler) or (None, None, None) on error
@@ -152,6 +152,7 @@ class StockETLPipeline:
         print(f"🔄 [TRANSFORM] Processing {symbol}...")
         
         df = raw_data.copy()
+        timesteps = 50 if is_global else 60
         
         # --- Action 1: Calculate Indicators ---
         try:
@@ -175,8 +176,8 @@ class StockETLPipeline:
             # Drop NaNs created by indicators
             df.dropna(inplace=True)
             
-            if len(df) < 60:
-                print(f"   ⚠ Insufficient data after indicators for {symbol} (Rows: {len(df)})")
+            if len(df) < timesteps:
+                print(f"   ⚠ Insufficient data after indicators for {symbol} (Rows: {len(df)}, Need: {timesteps})")
                 return None, None, None
 
         except Exception as e:
@@ -213,12 +214,12 @@ class StockETLPipeline:
             
             scaled_data = scaler.transform(features_to_scale)
             
-            # Get last 60 points for prediction
-            if len(scaled_data) < 60:
-                print(f"   ⚠ Insufficient scaled data for {symbol}")
+            # Get last N timesteps for prediction (50 for global, 60 for local)
+            if len(scaled_data) < timesteps:
+                print(f"   ⚠ Insufficient scaled data for {symbol} (Have: {len(scaled_data)}, Need: {timesteps})")
                 return None, None, None
                 
-            last_60_scaled = scaled_data[-60:]
+            last_n_scaled = scaled_data[-timesteps:]
             
             # Prepare explanation data
             latest_row = df.iloc[-1]
@@ -229,11 +230,12 @@ class StockETLPipeline:
                 'Volume': int(latest_row['Volume'])
             }
             
-            return last_60_scaled, explanation_data, scaler
+            return last_n_scaled, explanation_data, scaler
 
         except Exception as e:
             print(f"   ❌ Error scaling data for {symbol}: {e}")
             return None, None, None
+
 
     def _predict(self, model, scaled_data, scaler):
         """
@@ -242,7 +244,7 @@ class StockETLPipeline:
         
         Args:
             model: Loaded Keras model
-            scaled_data: Scaled input sequence (60 timesteps)
+            scaled_data: Scaled input sequence (50 or 60 timesteps)
             scaler: Scaler object for inverse transformation
         
         Returns:
@@ -254,7 +256,8 @@ class StockETLPipeline:
             
         try:
             n_features = scaled_data.shape[1]
-            input_seq = scaled_data.reshape(1, 60, n_features)
+            timesteps = scaled_data.shape[0]  # Dynamic: 50 or 60
+            input_seq = scaled_data.reshape(1, timesteps, n_features)
             
             predictions = []
             current_batch = input_seq.copy()
@@ -297,6 +300,7 @@ class StockETLPipeline:
         except Exception as e:
             print(f"   ❌ Prediction error: {e}")
             return None
+
 
     def _generate_explanation(self, data):
         """
@@ -367,7 +371,6 @@ class StockETLPipeline:
             print(f"   ❌ Error loading data to DB for {symbol}: {e}")
 
     # ==================== ORCHESTRATOR ====================
-    
     def run_pipeline(self):
         """
         Main orchestrator that runs the complete ETL pipeline.
@@ -381,14 +384,14 @@ class StockETLPipeline:
         
         # Process Global Stocks
         print("\n🌍 Processing Global Stocks (Always Run)...")
-        global_data_map = self.extract_data(settings.global_stocks)
+        global_data_map = self.extract_data(settings.global_stocks, is_global=True)
         
         for symbol, df in global_data_map.items():
             self._process_symbol(symbol, df, is_global=True)
         
         # Process Local Stocks (with 24h check)
         print("\n🇵🇰 Processing Local Stocks (24h Check)...")
-        local_data_map = self.extract_data(settings.local_stocks)
+        local_data_map = self.extract_data(settings.local_stocks, is_global=False)
         
         for symbol, df in local_data_map.items():
             last_update = db.get_last_update_time(symbol, is_global=False)
@@ -410,7 +413,6 @@ class StockETLPipeline:
         
         print("\n" + "=" * 60)
         print("✅ Pipeline run completed.\n")
-
     def _process_symbol(self, symbol, raw_data, is_global):
         """
         Process a single symbol through the ETL pipeline.
