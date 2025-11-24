@@ -92,4 +92,5 @@ wheel==0.45.1
 wrapt==1.17.2
 yfinance==0.2.65
 psycopg2-binary
+
 numpy<2.0
